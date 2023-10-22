@@ -1,11 +1,14 @@
 #![no_std]
 
+use bitfield::bitfield;
 use embedded_hal::blocking::delay::DelayMs;
-use fixed::types::{U22F10, U24F8};
 
 pub mod submodules;
+pub use crate::submodules::registers::Oversampling;
+use crate::submodules::registers::{Mode, RawMeasures, Status};
 use submodules::registers::{
-    Calib00_25, Calib00_25Arr, Calib26_41, Calib26_41Arr, Id, RegAddr, RegSize, Reset,
+    Calib00_25, Calib00_25Arr, Calib26_41, Calib26_41Arr, CtrlHum, CtrlMeas, Id, RegAddr, RegSize,
+    Reset,
 };
 
 pub struct CalibData {
@@ -74,11 +77,19 @@ pub enum Bme280Error<InterfaceE> {
     IdDoesNotMatch,
 }
 
-pub struct Bme280<InterfaceT: RegRead + RegWrite, DelayT> {
+pub struct Bme280<InterfaceT, DelayT> {
     interface: InterfaceT,
     dev_addr: u8,
     calib_data: CalibData,
     delay: DelayT,
+    config: Bme280Config,
+}
+
+#[derive(Default)]
+pub struct Bme280Config {
+    pub hum_oversampling: Oversampling,
+    pub temp_oversampling: Oversampling,
+    pub press_oversampling: Oversampling,
 }
 
 impl<InterfaceT, InterfaceE, DelayT> Bme280<InterfaceT, DelayT>
@@ -86,10 +97,11 @@ where
     InterfaceT: RegRead<Error = InterfaceE> + RegWrite<Error = InterfaceE>,
     DelayT: DelayMs<u16>,
 {
-    pub fn new(
+    pub fn init(
         mut interface: InterfaceT,
         dev_addr: u8,
         mut delay: DelayT,
+        config: Bme280Config,
     ) -> Result<Self, Bme280Error<InterfaceE>> {
         Self::reset(&mut interface, dev_addr, &mut delay)?;
 
@@ -97,25 +109,59 @@ where
             return Err(Bme280Error::IdDoesNotMatch);
         }
 
-        Ok(Self {
+        let mut bme280 = Self {
             calib_data: Self::read_calib(&mut interface, dev_addr)?,
             dev_addr,
             interface,
             delay,
-        })
+            config,
+        };
+        bme280.apply_cfg()?;
+        Ok(bme280)
+    }
+
+    fn apply_cfg(&mut self) -> Result<(), Bme280Error<InterfaceE>> {
+        let mut ctrl_meas = CtrlMeas(0);
+        let mut ctrl_hum = CtrlHum(0);
+
+        ctrl_meas.set_temp_oversampling(self.config.temp_oversampling as u8);
+        ctrl_meas.set_press_oversampling(self.config.press_oversampling as u8);
+        ctrl_hum.set_oversampling(self.config.hum_oversampling as u8);
+
+        self.interface
+            .reg_write(self.dev_addr, CtrlMeas::START_ADDR, ctrl_meas.0)
+            .map_err(Bme280Error::Inteface)?;
+        self.interface
+            .reg_write(self.dev_addr, CtrlHum::START_ADDR, ctrl_hum.0)
+            .map_err(Bme280Error::Inteface)?;
+
+        Ok(())
+    }
+
+    fn set_mode(&mut self, mode: Mode) -> Result<(), Bme280Error<InterfaceE>> {
+        let mut buf = [0];
+        self.interface
+            .reg_read(self.dev_addr, CtrlMeas::START_ADDR, &mut buf)
+            .map_err(Bme280Error::Inteface)?;
+        let mut ctrl_meas = CtrlMeas(buf[0]);
+        ctrl_meas.set_mode(mode as u8);
+        self.interface
+            .reg_write(self.dev_addr, CtrlMeas::START_ADDR, ctrl_meas.0)
+            .map_err(Bme280Error::Inteface)?;
+        Ok(())
     }
 
     fn read_calib(
-        inteface: &mut InterfaceT,
+        interface: &mut InterfaceT,
         dev_addr: u8,
     ) -> Result<CalibData, Bme280Error<InterfaceE>> {
         let mut calib00_25 = Calib00_25([0; Calib00_25Arr::REG_SIZE]);
         let mut calib26_41 = Calib26_41([0; Calib26_41Arr::REG_SIZE]);
 
-        inteface
+        interface
             .reg_read(dev_addr, Calib00_25Arr::START_ADDR, &mut calib00_25.0)
             .map_err(Bme280Error::Inteface)?;
-        inteface
+        interface
             .reg_read(dev_addr, Calib26_41Arr::START_ADDR, &mut calib26_41.0)
             .map_err(Bme280Error::Inteface)?;
 
@@ -146,12 +192,52 @@ where
         Ok(Id(buf[0]).get_id())
     }
 
-    // From BME 280 datasheet page 25
-    fn compensate_t(calib_data: &CalibData, adc_t: i32) -> (i32, i32) {
-        let var1 =
-            (((adc_t >> 3) - ((calib_data.dig_t1 as i32) << 1)) * (calib_data.dig_t2 as i32)) >> 11;
-        let var2 = (((((adc_t >> 4) - (calib_data.dig_t1 as i32))
-            * ((adc_t >> 4) - (calib_data.dig_t1 as i32)))
+    pub fn do_measurement(&mut self) -> Result<(I22F10, I24F8, I22F10), Bme280Error<InterfaceE>> {
+        // Set mode to forced
+        self.set_mode(Mode::Forced)?;
+
+        let mut measuring = true;
+        while measuring {
+            let mut buf = [0];
+            self.interface
+                .reg_read(self.dev_addr, Status::START_ADDR, &mut buf)
+                .map_err(Bme280Error::Inteface)?;
+            let status = Status(buf[0]);
+            measuring = status.get_measuring() == 1;
+
+            self.delay.delay_ms(10);
+        }
+
+        // Read out measures
+        let mut buf = [0; RawMeasures::REG_SIZE];
+        self.interface
+            .reg_read(self.dev_addr, RawMeasures::START_ADDR, &mut buf)
+            .map_err(Bme280Error::Inteface)?;
+        let raw_measures = RawMeasures(buf);
+
+        let (t_fine, temp) = Self::compensate_t(&self.calib_data, raw_measures.get_temp());
+        let pres = Self::compensate_p(&self.calib_data, t_fine, raw_measures.get_press());
+        let hum = Self::compensate_h(&self.calib_data, t_fine, raw_measures.get_hum());
+
+        // Scale temp
+        let temp = I22F10::new(temp, 0) / I22F10::new(100, 0);
+
+        Ok((temp, pres, hum))
+    }
+
+    pub fn get_calib(&self) -> &CalibData {
+        &self.calib_data
+    }
+}
+
+// From BME 280 datasheet page 25
+impl<T1, T2> Bme280<T1, T2> {
+    fn compensate_t(calib_data: &CalibData, adc_t: u32) -> (i32, i32) {
+        let var1 = (((adc_t >> 3) as i32 - ((calib_data.dig_t1 as i32) << 1))
+            * (calib_data.dig_t2 as i32))
+            >> 11;
+        let var2 = (((((adc_t >> 4) as i32 - (calib_data.dig_t1 as i32))
+            * ((adc_t >> 4) as i32 - (calib_data.dig_t1 as i32)))
             >> 12)
             * (calib_data.dig_t3 as i32))
             >> 14;
@@ -161,8 +247,7 @@ where
         (t_fine, t)
     }
 
-    // From BME 280 datasheet page 25
-    fn compensate_p(calib_data: &CalibData, t_fine: i32, adc_p: i32) -> U24F8 {
+    fn compensate_p(calib_data: &CalibData, t_fine: i32, adc_p: u32) -> I24F8 {
         let mut var1 = (t_fine as i64) - 128000;
         let mut var2 = var1 * var1 * calib_data.dig_p6 as i64;
         var2 += (var1 * calib_data.dig_p5 as i64) << 17;
@@ -171,7 +256,7 @@ where
             + ((var1 * calib_data.dig_p2 as i64) << 12);
         var1 = (((1 << 47) + var1) * calib_data.dig_p1 as i64) >> 33;
         if var1 == 0 {
-            return U24F8::ZERO; // avoid exception caused by division by zero
+            return I24F8(0); // avoid exception caused by division by zero
         }
         let mut p = 1048576 - adc_p as i64;
         p = (((p << 31) - var2) * 3125) / var1;
@@ -179,13 +264,12 @@ where
         var2 = ((calib_data.dig_p8 as i64) * p) >> 19;
         p = ((p + var1 + var2) >> 8) + ((calib_data.dig_p7 as i64) << 4);
 
-        U24F8::from_bits(p as u32)
+        I24F8(p as u32)
     }
 
-    // From BME 280 datasheet page 25
-    fn compensate_h(calib_data: &CalibData, t_fine: i32, adc_h: i32) -> U22F10 {
+    fn compensate_h(calib_data: &CalibData, t_fine: i32, adc_h: u32) -> I22F10 {
         let mut val = t_fine - 76800;
-        val = ((((adc_h << 14)
+        val = ((((adc_h << 14) as i32
             - ((calib_data.dig_h4 as i32) << 20)
             - ((calib_data.dig_h5 as i32) * val))
             + (16384))
@@ -200,11 +284,59 @@ where
         val = val - (((((val >> 15) * (val >> 15)) >> 7) * (calib_data.dig_h1 as i32)) >> 4);
         val = val.clamp(0, 419430400);
         val >>= 12;
-        U22F10::from_bits(val as u32)
+        I22F10(val as u32)
     }
+}
 
-    pub fn get_calib(&self) -> &CalibData {
-        &self.calib_data
+bitfield! {
+    #[derive(PartialEq, Eq, Debug, Clone, Copy)]
+    pub struct I22F10(u32);
+    pub u32, get_frac, set_frac: 9, 0;
+    pub i32, get_int, set_int: 31, 10;
+}
+
+impl core::ops::Div for I22F10 {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self::Output {
+        let lsh = self.0 as u64;
+        let rhs = rhs.0 as u64;
+        Self((lsh * (1 << 10) / rhs) as u32)
+    }
+}
+
+impl I22F10 {
+    pub fn new(int: i32, frac: u32) -> Self {
+        let mut num = Self(0);
+        num.set_int(int);
+        num.set_frac(frac);
+        num
+    }
+}
+
+bitfield! {
+    #[derive(PartialEq, Eq, Debug, Clone, Copy)]
+    pub struct I24F8(u32);
+    pub u32, get_frac, set_frac: 7, 0;
+    pub i32, get_int, set_int: 31, 8;
+}
+
+impl core::ops::Div for I24F8 {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self::Output {
+        let lsh = self.0 as u64;
+        let rhs = rhs.0 as u64;
+        Self((lsh * (1 << 8) / rhs) as u32)
+    }
+}
+
+impl I24F8 {
+    pub fn new(int: i32, frac: u32) -> Self {
+        let mut num = Self(0);
+        num.set_int(int);
+        num.set_frac(frac);
+        num
     }
 }
 
@@ -280,7 +412,7 @@ mod tests {
         // Magic numbers obtained by dumping values from proofed to work bme280 lib
         let mock_adc_p = 322858;
         let mock_t_fine = 120188;
-        let expected_p = U24F8::from_bits(26110518);
+        let expected_p = I24F8(26110518);
 
         let p = Bme280::<DummyInterface, DummyDelay>::compensate_p(
             MOCK_CALIB_DATA,
@@ -295,7 +427,7 @@ mod tests {
         // Magic numbers obtained by dumping values from proofed to work bme280 lib
         let mock_adc_h = 23549;
         let mock_t_fine = 99523;
-        let expected_h = U22F10::from_bits(27726);
+        let expected_h = I22F10(27726);
 
         let p = Bme280::<DummyInterface, DummyDelay>::compensate_h(
             MOCK_CALIB_DATA,

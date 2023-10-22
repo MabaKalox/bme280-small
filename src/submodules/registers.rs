@@ -64,7 +64,7 @@ impl<T> RegAddr for Calib26_41<T> {
     const END_ADDR: u8 = 0xF0;
 }
 impl<T: AsRef<[u8]>> Calib26_41<T> {
-    // Manually implemented due to weird bit order
+    // Manually implemented due to different bit layout
     pub fn get_dig_h4(&self) -> i16 {
         let arr = self.0.as_ref();
         (arr[3] as i16) << 4 | (arr[4] & 0x0F) as i16
@@ -85,8 +85,8 @@ impl Reset {
 }
 
 bitfield! {
-    struct CtrlHum(u8);
-    u8, get_oversampling, set_oversampling: 2, 0;
+    pub struct CtrlHum(u8);
+    pub u8, get_oversampling, set_oversampling: 2, 0;
 }
 impl RegAddr for CtrlHum {
     const START_ADDR: u8 = 0xF2;
@@ -94,9 +94,9 @@ impl RegAddr for CtrlHum {
 }
 
 bitfield! {
-    struct Status(u8);
-    u8, get_im_update, _: 1, 0;
-    u8, get_measuring, _: 4, 3;
+    pub struct Status(u8);
+    pub u8, get_im_update, _: 1, 0;
+    pub u8, get_measuring, _: 4, 3;
 }
 impl RegAddr for Status {
     const START_ADDR: u8 = 0xF3;
@@ -104,10 +104,10 @@ impl RegAddr for Status {
 }
 
 bitfield! {
-    struct CtrlMeas(u8);
-    u8, get_mode, set_mode: 1, 0;
-    u8, get_press_oversampling, set_press_oversampling: 4, 2;
-    u8, get_temp_oversampling, set_temp_oversampling: 7, 5;
+    pub struct CtrlMeas(u8);
+    pub u8, get_mode, set_mode: 1, 0;
+    pub u8, get_press_oversampling, set_press_oversampling: 4, 2;
+    pub u8, get_temp_oversampling, set_temp_oversampling: 7, 5;
 }
 impl RegAddr for CtrlMeas {
     const START_ADDR: u8 = 0xF4;
@@ -126,49 +126,27 @@ impl RegAddr for Config {
 }
 
 bitfield! {
-    struct RawPress(u32);
-    u8, get_msb, set_msb: 0, 7;
-    u8, get_lsb, set_lsb: 8, 16;
-    u8, get_xlsb, set_xlsb: 20, 23;
+    pub struct RawMeasures(MSB0 [u8]);
+    pub u32, get_press, _: 19, 0;
+    pub u32, get_temp, _: 43, 24;
+    pub u32, get_hum, _: 63, 48;
 }
-impl RegAddr for RawPress {
+impl RegAddr for RawMeasures<[u8; 8]> {
     const START_ADDR: u8 = 0xF7;
-    const END_ADDR: u8 = 0xF9;
-}
-
-bitfield! {
-    struct RawTemp(u32);
-    u8, get_msb, set_msb: 0, 7;
-    u8, get_lsb, set_lsb: 8, 16;
-    u8, get_xlsb, set_xlsb: 20, 23;
-}
-impl RegAddr for RawTemp {
-    const START_ADDR: u8 = 0xFA;
-    const END_ADDR: u8 = 0xFC;
-}
-
-bitfield! {
-    struct RawHum(u32);
-    u8, get_msb, set_msb: 0, 7;
-    u8, get_lsb, set_lsb: 8, 16;
-    u8, get_xlsb, set_xlsb: 20, 23;
-}
-impl RegAddr for RawHum {
-    const START_ADDR: u8 = 0xFD;
     const END_ADDR: u8 = 0xFE;
 }
 
 #[repr(u8)]
 #[derive(num_enum::TryFromPrimitive)]
-enum Mode {
+pub enum Mode {
     Sleep = 0b00,
     Forced = 0b01,
-    ForcedAlt = 0b10, // Same as Forsed
+    ForcedAlt = 0b10, // Same as Forced
     Normal = 0b11,
 }
 
 #[repr(u8)]
-enum StandbyPeriod {
+pub enum StandbyPeriod {
     Us500 = 0b000,
     Us62500 = 0b001,
     Ms125 = 0b010,
@@ -180,8 +158,9 @@ enum StandbyPeriod {
 }
 
 #[repr(u8)]
-#[derive(num_enum::TryFromPrimitive)]
-enum Oversampling {
+#[derive(num_enum::TryFromPrimitive, Default, Clone, Copy)]
+pub enum Oversampling {
+    #[default]
     ModuleDisabled = 0b000,
     X1 = 0b001,
     X2 = 0b010,
@@ -192,7 +171,7 @@ enum Oversampling {
 
 #[repr(u8)]
 #[derive(num_enum::TryFromPrimitive)]
-enum Filter {
+pub enum Filter {
     Off = 0b000,
     C2 = 0b001,
     C4 = 0b010,
